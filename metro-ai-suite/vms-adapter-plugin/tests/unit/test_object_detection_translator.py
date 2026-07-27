@@ -21,6 +21,7 @@ def _sample_payload(*, with_rtp: bool = True, objects: list | None = None) -> di
         if objects is not None
         else [
             {
+                "id": 293,
                 "detection": {
                     "bounding_box": {
                         "x_min": 0.10,
@@ -84,6 +85,35 @@ def test_translate_timestamp_offset_applied_to_ntp():
     assert ts == ntp_ns // 1_000_000 + offset
 
 
+def test_translate_skewed_rtp_falls_back_to_wall_clock():
+    payload = _sample_payload(with_rtp=False)
+    payload["rtp"] = {"sender_ntp_unix_timestamp_ns": 1_000_000}
+    before = int(time.time() * 1000)
+    _, ts = translate_dls_metadata(payload)
+    after = int(time.time() * 1000)
+    assert before <= ts <= after
+
+
+def test_translate_prefers_pipeline_time_when_rtp_is_skewed():
+    wall_clock_ms = int(time.time() * 1000)
+    payload = _sample_payload(with_rtp=False)
+    payload["rtp"] = {"sender_ntp_unix_timestamp_ns": 1_000_000}
+    payload["time"] = (wall_clock_ms - 300) * 1_000_000
+    _, ts = translate_dls_metadata(payload)
+    assert abs(ts - (wall_clock_ms - 300)) <= 100
+
+
+def test_translate_skewed_pipeline_time_falls_back_to_wall_clock():
+    wall_clock_ms = int(time.time() * 1000)
+    payload = _sample_payload(with_rtp=False)
+    payload["rtp"] = {"sender_ntp_unix_timestamp_ns": 1_000_000}
+    payload["time"] = (wall_clock_ms - 1500) * 1_000_000
+    before = int(time.time() * 1000)
+    _, ts = translate_dls_metadata(payload)
+    after = int(time.time() * 1000)
+    assert before <= ts <= after
+
+
 def test_translate_single_object_fields():
     objects, _ = translate_dls_metadata(_sample_payload())
     assert len(objects) == 1
@@ -115,14 +145,23 @@ def test_translate_bounding_box_values():
     assert abs(float(h_s) - 0.40) < 1e-3   # 0.60 - 0.20
 
 
-def test_translate_region_id_gives_stable_track_id():
+def test_translate_object_id_gives_stable_track_id():
     objects1, _ = translate_dls_metadata(_sample_payload())
     objects2, _ = translate_dls_metadata(_sample_payload())
     assert objects1[0]["trackId"] == objects2[0]["trackId"]
 
 
+def test_translate_region_id_falls_back_to_stable_track_id():
+    payload = _sample_payload()
+    payload["objects"][0].pop("id")
+    objects1, _ = translate_dls_metadata(payload)
+    objects2, _ = translate_dls_metadata(payload)
+    assert objects1[0]["trackId"] == objects2[0]["trackId"]
+
+
 def test_translate_no_region_id_gives_random_track_id():
     payload = _sample_payload()
+    payload["objects"][0].pop("id")
     payload["objects"][0].pop("region_id")
     objects1, _ = translate_dls_metadata(payload)
     objects2, _ = translate_dls_metadata(payload)
@@ -141,6 +180,55 @@ def test_translate_skips_object_with_missing_bbox():
     bad_obj = {"detection": {"confidence": 0.5, "label": "x"}, "region_id": 1}
     objects, _ = translate_dls_metadata({"objects": [bad_obj]})
     assert objects == []
+
+
+def test_translate_unlabeled_region_object_falls_back_to_unknown():
+    payload = {
+        "objects": [
+            {
+                "id": 1,
+                "detection": {
+                    "bounding_box": {
+                        "x_min": 0.0,
+                        "y_min": 0.1,
+                        "x_max": 0.2,
+                        "y_max": 0.3,
+                    },
+                    "confidence": None,
+                    "label": "",
+                },
+                "region_id": 0,
+            }
+        ]
+    }
+    objects, _ = translate_dls_metadata(payload)
+    assert len(objects) == 1
+    assert objects[0]["attributes"][0]["value"] == "unknown"
+    assert objects[0]["typeId"] == _TYPE_DEFAULT
+
+
+def test_translate_null_confidence_defaults_to_zero():
+    payload = {
+        "objects": [
+            {
+                "id": 293,
+                "detection": {
+                    "bounding_box": {
+                        "x_min": 0.08,
+                        "y_min": 0.35,
+                        "x_max": 0.10,
+                        "y_max": 0.49,
+                    },
+                    "confidence": None,
+                    "label": "pedestrian",
+                },
+                "region_id": 2,
+            }
+        ]
+    }
+    objects, _ = translate_dls_metadata(payload)
+    assert objects[0]["confidence"] == 0.0
+    assert objects[0]["attributes"][0]["confidence"] == 0.0
 
 
 def test_translate_label_falls_back_to_roi_type():

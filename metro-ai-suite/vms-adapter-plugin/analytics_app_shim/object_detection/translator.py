@@ -35,6 +35,16 @@ from typing import Any
 
 
 _TYPE_DEFAULT = "python.detected.object"
+_MAX_TIMESTAMP_SKEW_MS = 750
+
+
+def _ns_epoch_to_ms(value: Any) -> int:
+    """Convert an epoch-nanoseconds value to epoch-milliseconds."""
+    try:
+        ns = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return ns // 1_000_000 if ns > 0 else 0
 
 
 def _label_to_type_id(label: str, label_type_map: dict[str, str]) -> str:
@@ -44,6 +54,14 @@ def _label_to_type_id(label: str, label_type_map: dict[str, str]) -> str:
     Falls back to ``python.detected.object`` for unrecognised labels.
     """
     return label_type_map.get(label.lower(), _TYPE_DEFAULT)
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    """Best-effort float conversion for optional numeric fields."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def translate_dls_metadata(
@@ -79,9 +97,22 @@ def translate_dls_metadata(
     unrecognised labels.
     """
     _map = {k.lower(): v for k, v in (label_type_map or {}).items()}
+    wall_clock_ms = int(time.time() * 1000)
     rtp = payload.get("rtp") or {}
-    ntp_ns = rtp.get("sender_ntp_unix_timestamp_ns", 0)
-    timestamp_ms = (ntp_ns // 1_000_000 if ntp_ns else int(time.time() * 1000)) + timestamp_offset_ms
+    ntp_ms = _ns_epoch_to_ms(rtp.get("sender_ntp_unix_timestamp_ns", 0))
+    pipeline_time_ms = _ns_epoch_to_ms(payload.get("time", 0))
+
+    # Prefer a payload-derived epoch timestamp when it is reasonably close to
+    # current wall-clock time. If multiple are plausible, use the one with the
+    # smallest skew. Fall back to wall-clock time if all payload clocks are stale.
+    candidates = [ts for ts in (ntp_ms, pipeline_time_ms) if ts > 0]
+    valid = [ts for ts in candidates if abs(wall_clock_ms - ts) <= _MAX_TIMESTAMP_SKEW_MS]
+    if valid:
+        base_timestamp_ms = min(valid, key=lambda ts: abs(wall_clock_ms - ts))
+    else:
+        base_timestamp_ms = wall_clock_ms
+
+    timestamp_ms = base_timestamp_ms + timestamp_offset_ms
 
     objects: list[dict[str, Any]] = []
     for obj in payload.get("objects", []):
@@ -100,12 +131,16 @@ def translate_dls_metadata(
         # Nx bounding box format: "x,y,widthxheight" (all normalized 0–1)
         bounding_box = f"{x_min:.4f},{y_min:.4f},{width:.4f}x{height:.4f}"
 
-        confidence = float(detection.get("confidence", 0.0))
-        label = detection.get("label") or obj.get("roi_type") or "unknown"
-        region_id = obj.get("region_id")
+        confidence = _to_float(detection.get("confidence"), 0.0)
+        label = str(detection.get("label") or obj.get("roi_type") or "unknown").strip() or "unknown"
 
-        # Use region_id as a stable per-object track seed; fall back to random UUID.
-        track_id = str(uuid.UUID(int=region_id)) if region_id else str(uuid.uuid4())
+        object_seed = obj.get("id")
+        region_id = obj.get("region_id")
+        track_seed = object_seed if object_seed is not None else region_id
+
+        # Prefer the DLS object id for stable tracking. Fall back to region_id,
+        # then to a random UUID when neither identifier is present.
+        track_id = str(uuid.UUID(int=int(track_seed))) if track_seed is not None else str(uuid.uuid4())
 
         type_id = _label_to_type_id(label, _map)
 

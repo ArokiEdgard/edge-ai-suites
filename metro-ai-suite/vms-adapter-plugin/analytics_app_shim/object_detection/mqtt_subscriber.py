@@ -45,6 +45,11 @@ class MqttSubscriber:
         task.cancel()
     """
 
+    def __init__(self) -> None:
+        # Keep per-device timestamps monotonic to avoid out-of-order metadata
+        # causing overlays to appear at past object locations.
+        self._last_timestamp_ms: dict[str, int] = {}
+
     async def run(
         self,
         mqtt_host: str,
@@ -156,6 +161,11 @@ class MqttSubscriber:
 
         # device_id = camera_id without vendor prefix (e.g. "nx:abc" → "abc")
         device_id = camera_id.split(":", 1)[-1] if ":" in camera_id else camera_id
+
+        previous_ts = self._last_timestamp_ms.get(device_id)
+        if previous_ts is not None and timestamp_ms <= previous_ts:
+            timestamp_ms = previous_ts + 1
+        self._last_timestamp_ms[device_id] = timestamp_ms
 
         ok = await shim.push_analytics_objects(device_id, objects, timestamp_ms)
         if not ok:
